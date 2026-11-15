@@ -1,9 +1,10 @@
-"""FastAPI 应用：报告提交与判读 API。
+"""FastAPI 应用：报告提交、判读与交接对账 API。
 
 - POST /reports                          提交（或重传）某站点某采样日的完整日报
 - GET  /reports/{station}/{date}         读取现行（或 ?revision= 指定）报告
 - GET  /reports/{station}/{date}/revisions  列出该日全部已提交修订
 - GET  /interpretation                   七日窗口判读
+- POST /handover/reconcile               现场采样交接补正对账
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, RedirectResponse
 
 from .db import Database, rollback_quietly
+from .handover import reconcile
 from .logic import (
     STATUS_ZH,
     WINDOW_DAYS,
@@ -27,10 +29,17 @@ from .logic import (
     content_hash,
     interpret_window,
 )
-from .models import Name, NonNegFinite, ReportSubmission, SubmitResponse
+from .models import (
+    HandoverReconciliationRequest,
+    HandoverReconciliationResponse,
+    Name,
+    NonNegFinite,
+    ReportSubmission,
+    SubmitResponse,
+)
 
 DESCRIPTION = """\
-流域监测报告提交与判读 API。
+流域监测报告提交、判读与交接对账 API。
 
 **提交规则**
 - 实验室按站点+采样日提交包含全部污染物的完整日报，修订号递增（正整数）。
@@ -45,6 +54,16 @@ DESCRIPTION = """\
 - “未检出”按半开区间 [0, 检出限) 参与均值；实测值即点值。
 - 均值必定 ≤ 限值 → `compliant`（达标）；必定 > 限值 → `exceeds`（超标）；
   其余 → `pending_review`（待复核）。响应含所用修订号。
+
+**交接对账**
+- 提交最多 30 条样本记录（样本 ID、站点、采样日、应检污染物、可选被替换样本 ID），
+  补正可乱序，也可改站点或采样日。
+- 沿替换关系确定每个站日的最终样本，与**同一已提交快照**中的现行完整日报比对应检项目：
+  项目完全一致 → `warehouseable_reports`（可入仓日报 ID + 修订号）；
+  无现行报告 → `missing_reports`（缺报）；缺项 → `missing_items`；多项 → `extra_items`。
+- 缺前驱、成环、分叉、同站日多个最终样本 → 相关站日列入 `handover_conflicts`。
+- 跨站日补正让出的旧位置即使有报告也列入 `pending_verification`（待核对，不得入仓）。
+- 对账在单个读事务内取同一快照（`snapshot_seq`），并发补报/修订不会混用不同时点的日报。
 """
 
 
@@ -72,8 +91,8 @@ def _json_safe(obj: Any) -> Any:
 def create_app(db_path: Optional[str] = None) -> FastAPI:
     db = Database(db_path or os.environ.get("DB_PATH", "app.db"))
     app = FastAPI(
-        title="流域监测报告提交与判读 API",
-        version="1.0.0",
+        title="流域监测报告提交、判读与交接对账 API",
+        version="1.1.0",
         description=DESCRIPTION,
     )
     app.state.db = db
@@ -356,6 +375,87 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             "missing_pollutant_dates": result["missing_pollutant_dates"],
             "snapshot_seq": snapshot,
         }
+
+    # ---------------- 交接对账 ----------------
+
+    @app.post(
+        "/handover/reconcile",
+        response_model=HandoverReconciliationResponse,
+        tags=["handover"],
+        summary="交接补正对账",
+        responses={
+            200: {"description": "对账结果（含可入仓、缺报、缺项、多项、冲突与待核对）"},
+            422: {"description": "请求体校验失败（样本数 1..30、样本 ID 唯一等）"},
+            503: {"description": "数据库繁忙，可重试"},
+        },
+    )
+    def reconcile_handover(
+        payload: HandoverReconciliationRequest,
+    ) -> HandoverReconciliationResponse:
+        """按替换关系确定每个站日的最终样本，与同一快照的现行日报比对。
+
+        - 补正可乱序提交，也可修改站点或采样日；
+        - 缺前驱、成环、分叉、同站日多个最终样本 → 相关站日列为交接冲突；
+        - 跨站日补正让出的旧位置即使有报告也列为待核对，不得入仓；
+        - 整批报告在单个读事务内取自同一已提交时点（snapshot_seq）。
+        """
+        samples = [
+            {
+                "sample_id": s.sample_id,
+                "station": s.station,
+                "sampling_date": s.sampling_date.isoformat(),
+                "pollutants": [p for p in s.pollutants],
+                "replaces_sample_id": s.replaces_sample_id,
+            }
+            for s in payload.samples
+        ]
+        wanted_days = sorted(
+            {(s["station"], s["sampling_date"]) for s in samples}
+        )
+
+        conn = db.connect()
+        try:
+            # 单读事务：MAX(id) 固定快照时点，之后各站日现行日报均来自同一时点
+            conn.execute("BEGIN")
+            snapshot = conn.execute(
+                "SELECT COALESCE(MAX(id),0) FROM reports"
+            ).fetchone()[0]
+            reports: dict[tuple[str, str], dict[str, Any]] = {}
+            for station, day in wanted_days:
+                row = conn.execute(
+                    "SELECT id, revision FROM reports "
+                    "WHERE station=? AND sampling_date=? AND id<=? "
+                    "ORDER BY revision DESC LIMIT 1",
+                    (station, day, snapshot),
+                ).fetchone()
+                if row is None:
+                    continue
+                items = conn.execute(
+                    "SELECT pollutant FROM report_items WHERE report_id=?",
+                    (row["id"],),
+                ).fetchall()
+                reports[(station, day)] = {
+                    "report_id": row["id"],
+                    "revision": row["revision"],
+                    "pollutants": {r["pollutant"] for r in items},
+                }
+            conn.execute("COMMIT")
+        except sqlite3.OperationalError as exc:
+            rollback_quietly(conn)
+            if "locked" in str(exc).lower():
+                raise HTTPException(
+                    status_code=503,
+                    detail={"error": "busy", "message": "数据库繁忙，请重试"},
+                ) from exc
+            raise
+        except Exception:
+            rollback_quietly(conn)
+            raise
+        finally:
+            conn.close()
+
+        result = reconcile(samples, reports)
+        return HandoverReconciliationResponse(snapshot_seq=snapshot, **result)
 
     return app
 
